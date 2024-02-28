@@ -1,4 +1,4 @@
-import { ClickHouse } from 'clickhouse';
+import { ClickHouseClient, createClient } from '@clickhouse/client';
 import dateFormat from 'dateformat';
 import debug from 'debug';
 import { CLICKHOUSE } from 'lib/db';
@@ -17,7 +17,7 @@ export const CLICKHOUSE_DATE_FORMATS = {
 
 const log = debug('umami:clickhouse');
 
-let clickhouse: ClickHouse;
+let clickhouse: ClickHouseClient;
 const enabled = Boolean(process.env.CLICKHOUSE_URL);
 
 function getClient() {
@@ -25,18 +25,16 @@ function getClient() {
     hostname,
     port,
     pathname,
+    protocol,
     username = 'default',
     password,
   } = new URL(process.env.CLICKHOUSE_URL);
 
-  const client = new ClickHouse({
-    url: hostname,
-    port: Number(port),
-    format: 'json',
-    config: {
-      database: pathname.replace('/', ''),
-    },
-    basicAuth: password ? { username, password } : null,
+  const client = createClient({
+    host: `${protocol}//${hostname}:${port}`,
+    database: pathname.replace('/', ''),
+    username: username,
+    password,
   });
 
   if (process.env.NODE_ENV !== 'production') {
@@ -48,22 +46,22 @@ function getClient() {
   return client;
 }
 
-function getDateStringQuery(data, unit) {
+function getDateStringQuery(data: any, unit: string | number) {
   return `formatDateTime(${data}, '${CLICKHOUSE_DATE_FORMATS[unit]}')`;
 }
 
-function getDateQuery(field, unit, timezone?) {
+function getDateQuery(field: string, unit: string, timezone?: string) {
   if (timezone) {
     return `date_trunc('${unit}', ${field}, '${timezone}')`;
   }
   return `date_trunc('${unit}', ${field})`;
 }
 
-function getDateFormat(date) {
+function getDateFormat(date: Date) {
   return `'${dateFormat(date, 'UTC:yyyy-mm-dd HH:MM:ss')}'`;
 }
 
-function mapFilter(column, operator, name, type = 'String') {
+function mapFilter(column: string, operator: string, name: string, type = 'String') {
   switch (operator) {
     case OPERATORS.equals:
       return `${column} = {${name}:${type}}`;
@@ -112,13 +110,13 @@ async function parseFilters(websiteId: string, filters: QueryFilters = {}, optio
     params: {
       ...normalizeFilters(filters),
       websiteId,
-      startDate: maxDate(filters.startDate, new Date(website.resetAt)),
+      startDate: maxDate(filters.startDate, new Date(website?.resetAt)),
       websiteDomain: website.domain,
     },
   };
 }
 
-async function rawQuery<T>(query: string, params: object = {}): Promise<T> {
+async function rawQuery(query: string, params: Record<string, unknown> = {}): Promise<unknown> {
   if (process.env.LOG_QUERY) {
     log('QUERY:\n', query);
     log('PARAMETERS:\n', params);
@@ -126,10 +124,16 @@ async function rawQuery<T>(query: string, params: object = {}): Promise<T> {
 
   await connect();
 
-  return clickhouse.query(query, { params }).toPromise() as Promise<T>;
+  const resultSet = await clickhouse.query({
+    query: query,
+    query_params: params,
+    format: 'JSONEachRow',
+  });
+
+  return resultSet.json();
 }
 
-async function findUnique(data) {
+async function findUnique(data: any[]) {
   if (data.length > 1) {
     throw `${data.length} records found when expecting 1.`;
   }
@@ -137,7 +141,7 @@ async function findUnique(data) {
   return findFirst(data);
 }
 
-async function findFirst(data) {
+async function findFirst(data: any[]) {
   return data[0] ?? null;
 }
 
