@@ -1,34 +1,50 @@
-import useMessages from './useMessages';
 import { BROWSERS, OS_NAMES } from '@/lib/constants';
-import useLocale from './useLocale';
-import useCountryNames from './useCountryNames';
-import useLanguageNames from './useLanguageNames';
 import regions from '../../../public/iso-3166-2.json';
+import { useCountryNames } from './useCountryNames';
+import { useLanguageNames } from './useLanguageNames';
+import { useLocale } from './useLocale';
+import { useMessages } from './useMessages';
 
 export function useFormat() {
-  const { formatMessage, labels } = useMessages();
+  const { t, labels } = useMessages();
   const { locale } = useLocale();
   const { countryNames } = useCountryNames(locale);
   const { languageNames } = useLanguageNames(locale);
 
   const formatOS = (value: string): string => {
+    if (!value) {
+      return t(labels.unknown);
+    }
+
     return OS_NAMES[value] || value;
   };
 
   const formatBrowser = (value: string): string => {
+    if (!value || value === 'browser') {
+      return t(labels.unknown);
+    }
+
     return BROWSERS[value] || value;
   };
 
   const formatDevice = (value: string): string => {
-    return formatMessage(labels[value] || labels.unknown);
+    if (!value) {
+      return t(labels.unknown);
+    }
+
+    return labels[value] ? t(labels[value]) : value;
   };
 
   const formatCountry = (value: string): string => {
+    if (!value) {
+      return t(labels.unknown);
+    }
+
     return countryNames[value] || value;
   };
 
-  const formatRegion = (value: string): string => {
-    const [country] = value.split('-');
+  const formatRegion = (value?: string): string => {
+    const [country] = value?.split('-') || [];
     return regions[value] ? `${regions[value]}, ${countryNames[country]}` : value;
   };
 
@@ -40,7 +56,7 @@ export function useFormat() {
     return languageNames[value?.split('-')[0]] || value;
   };
 
-  const formatValue = (value: string, type: string, data?: { [key: string]: any }): string => {
+  const formatValue = (value: string, type: string, data?: Record<string, any>): string => {
     switch (type) {
       case 'os':
         return formatOS(value);
@@ -57,7 +73,7 @@ export function useFormat() {
       case 'language':
         return formatLanguage(value);
       default:
-        return value;
+        return typeof value === 'string' ? value : undefined;
     }
   };
 
@@ -72,5 +88,3 @@ export function useFormat() {
     formatValue,
   };
 }
-
-export default useFormat;

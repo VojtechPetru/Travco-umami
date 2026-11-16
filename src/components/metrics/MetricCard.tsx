@@ -1,7 +1,12 @@
-import classNames from 'classnames';
-import { useSpring, animated } from '@react-spring/web';
+import { Button, Column, Icon, Row, Text, Tooltip, TooltipTrigger } from '@umami/react-zen';
+import { useSpring, useTransform } from 'motion/react';
+import { type KeyboardEvent, type ReactNode, useEffect } from 'react';
+import { AnimatedDiv } from '@/components/common/AnimatedDiv';
+import { useReducedMotion } from '@/components/hooks/useReducedMotion';
+import { Info } from '@/components/icons';
+import { ChangeLabel } from '@/components/metrics/ChangeLabel';
+import { useMetricsBarJoined } from '@/components/metrics/MetricsBar';
 import { formatNumber } from '@/lib/format';
-import ChangeLabel from '@/components/metrics/ChangeLabel';
 import styles from './MetricCard.module.css';
 
 export interface MetricCardProps {
@@ -9,54 +14,115 @@ export interface MetricCardProps {
   previousValue?: number;
   change?: number;
   label?: string;
+  tooltip?: ReactNode;
   reverseColors?: boolean;
   formatValue?: (n: any) => string;
   showLabel?: boolean;
   showChange?: boolean;
-  showPrevious?: boolean;
-  className?: string;
+  /** Draw the card's own border and background. Defaults to off inside a joined `MetricsBar`, which provides them. */
+  bordered?: boolean;
+  /** Content shown under the value, such as a rating badge. */
+  footer?: ReactNode;
+  /** Makes the card selectable, e.g. to choose which metric a chart shows. */
+  onClick?: () => void;
+  selected?: boolean;
 }
 
 export const MetricCard = ({
   value = 0,
   change = 0,
   label,
+  tooltip,
   reverseColors = false,
   formatValue = formatNumber,
   showLabel = true,
   showChange = false,
-  showPrevious = false,
-  className,
+  bordered: borderedProp,
+  footer,
+  onClick,
+  selected = false,
 }: MetricCardProps) => {
+  const joined = useMetricsBarJoined();
+  const bordered = borderedProp ?? !joined;
+  const reducedMotion = useReducedMotion();
   const diff = value - change;
-  const pct = ((value - diff) / diff) * 100;
-  const props = useSpring({ x: Number(value) || 0, from: { x: 0 } });
-  const changeProps = useSpring({ x: Number(pct) || 0, from: { x: 0 } });
-  const prevProps = useSpring({ x: Number(diff) || 0, from: { x: 0 } });
+  const pct = diff !== 0 ? ((value - diff) / diff) * 100 : value !== 0 ? 100 : 0;
+  const x = Number(value) || 0;
+  const p = Number(pct) || 0;
+  const xSpring = useSpring(0, { stiffness: 170, damping: 26 });
+  const pctSpring = useSpring(0, { stiffness: 170, damping: 26 });
+  const valueText = useTransform(xSpring, n => formatValue(n));
+  const pctText = useTransform(pctSpring, n => `${Math.abs(~~n)}%`);
+
+  useEffect(() => {
+    if (reducedMotion) xSpring.jump(x);
+    else xSpring.set(x);
+  }, [x, xSpring, reducedMotion]);
+
+  useEffect(() => {
+    if (reducedMotion) pctSpring.jump(p);
+    else pctSpring.set(p);
+  }, [p, pctSpring, reducedMotion]);
+
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onClick?.();
+    }
+  };
 
   return (
-    <div className={classNames(styles.card, className, showPrevious && styles.compare)}>
-      {showLabel && <div className={styles.label}>{label}</div>}
-      <animated.div className={styles.value} title={value?.toString()}>
-        {props?.x?.to(x => formatValue(x))}
-      </animated.div>
+    <Column
+      className={
+        onClick
+          ? [styles.clickable, bordered && styles.bordered, selected && styles.selected]
+              .filter(Boolean)
+              .join(' ')
+          : undefined
+      }
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-pressed={onClick ? selected : undefined}
+      onClick={onClick}
+      onKeyDown={onClick ? handleKeyDown : undefined}
+      justifyContent="center"
+      paddingX="6"
+      paddingY="4"
+      borderRadius={bordered ? true : undefined}
+      backgroundColor={bordered ? 'surface' : undefined}
+      border={bordered ? true : undefined}
+      gap="2"
+    >
+      {showLabel && (
+        <Row justifyContent="space-between" alignItems="center">
+          <Text weight="bold" wrap="nowrap">
+            {label}
+          </Text>
+          {tooltip && (
+            <span className={styles.tooltip}>
+              <TooltipTrigger delay={0}>
+                <Button size="sm" variant="quiet">
+                  <Icon size="sm">
+                    <Info />
+                  </Icon>
+                </Button>
+                <Tooltip placement="top">{tooltip}</Tooltip>
+              </TooltipTrigger>
+            </span>
+          )}
+        </Row>
+      )}
+      <Text size="4xl" weight="bold" wrap="nowrap">
+        <AnimatedDiv title={value?.toString()}>
+          {reducedMotion ? formatValue(x) : valueText}
+        </AnimatedDiv>
+      </Text>
       {showChange && (
-        <ChangeLabel
-          className={styles.change}
-          value={change}
-          title={formatValue(change)}
-          reverseColors={reverseColors}
-        >
-          <animated.span>{changeProps?.x?.to(x => `${Math.abs(~~x)}%`)}</animated.span>
+        <ChangeLabel value={change} title={formatValue(change)} reverseColors={reverseColors}>
+          <AnimatedDiv>{reducedMotion ? `${Math.abs(~~p)}%` : pctText}</AnimatedDiv>
         </ChangeLabel>
       )}
-      {showPrevious && (
-        <animated.div className={classNames(styles.value, styles.prev)} title={diff.toString()}>
-          {prevProps?.x?.to(x => formatValue(x))}
-        </animated.div>
-      )}
-    </div>
+      {footer}
+    </Column>
   );
 };
-
-export default MetricCard;

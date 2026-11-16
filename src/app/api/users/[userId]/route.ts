@@ -1,8 +1,10 @@
-import { canDeleteUser, canUpdateUser, canViewUser, hashPassword } from '@/lib/auth';
-import { parseRequest } from '@/lib/request';
-import { badRequest, json, ok, unauthorized } from '@/lib/response';
-import { deleteUser, getUser, getUserByUsername, updateUser } from '@/queries';
 import { z } from 'zod';
+import { hashPassword } from '@/lib/password';
+import { parseRequest } from '@/lib/request';
+import { badRequest, json, notFound, ok, unauthorized } from '@/lib/response';
+import { userRoleParam } from '@/lib/schema';
+import { canDeleteUser, canUpdateUser, canViewUser } from '@/permissions';
+import { deleteUser, getUser, getUserByUsername, updateUser } from '@/queries/prisma';
 
 export async function GET(request: Request, { params }: { params: Promise<{ userId: string }> }) {
   const { auth, error } = await parseRequest(request);
@@ -24,9 +26,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ user
 
 export async function POST(request: Request, { params }: { params: Promise<{ userId: string }> }) {
   const schema = z.object({
-    username: z.string().max(255),
-    password: z.string().max(255).optional(),
-    role: z.string().regex(/admin|user|view-only/i),
+    username: z.string().max(255).optional(),
+    password: z.string().min(8).max(255).optional(),
+    role: userRoleParam.optional(),
   });
 
   const { auth, body, error } = await parseRequest(request, schema);
@@ -45,27 +47,32 @@ export async function POST(request: Request, { params }: { params: Promise<{ use
 
   const user = await getUser(userId);
 
+  if (!user) {
+    return notFound();
+  }
+
   const data: any = {};
 
-  if (password) {
+  // Only admin can change these fields. Users change their own password through
+  // /api/me/password, which requires the current password.
+  if (password && auth.user.isAdmin) {
     data.password = hashPassword(password);
   }
 
-  // Only admin can change these fields
   if (role && auth.user.isAdmin) {
     data.role = role;
   }
 
   if (username && auth.user.isAdmin) {
-    data.username = username;
+    data.username = username.toLowerCase();
   }
 
   // Check when username changes
   if (data.username && user.username !== data.username) {
-    const user = await getUserByUsername(username);
+    const existingUser = await getUserByUsername(data.username);
 
-    if (user) {
-      return badRequest('User already exists');
+    if (existingUser && existingUser.id !== userId) {
+      return badRequest({ message: 'User already exists' });
     }
   }
 
@@ -91,7 +98,7 @@ export async function DELETE(
   }
 
   if (userId === auth.user.id) {
-    return badRequest('You cannot delete yourself.');
+    return badRequest({ message: 'You cannot delete yourself.' });
   }
 
   await deleteUser(userId);

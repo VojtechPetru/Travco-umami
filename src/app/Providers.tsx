@@ -1,17 +1,20 @@
 'use client';
-import { IntlProvider } from 'react-intl';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ReactBasicsProvider } from 'react-basics';
-import ErrorBoundary from '@/components/common/ErrorBoundary';
+import { RouterProvider, ZenProvider } from '@umami/react-zen';
+import { NextIntlClientProvider } from 'next-intl';
+import { type ReactNode, useEffect } from 'react';
+import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { useLocale } from '@/components/hooks';
+import { type Config, ConfigContext } from '@/components/hooks/useConfig';
+import { FlagsContext, type FlagValues } from '@/components/hooks/useFlag';
 import 'chartjs-adapter-date-fns';
-import { useEffect } from 'react';
 
 const client = new QueryClient({
   defaultOptions: {
     queries: {
       retry: false,
       refetchOnWindowFocus: false,
+      staleTime: 1000 * 60,
     },
   },
 });
@@ -25,22 +28,34 @@ function MessagesProvider({ children }) {
   }, [locale, dir]);
 
   return (
-    <IntlProvider locale={locale} messages={messages[locale]} onError={() => null}>
+    <NextIntlClientProvider locale={locale} messages={messages[locale]} onError={() => null}>
       {children}
-    </IntlProvider>
+    </NextIntlClientProvider>
   );
 }
 
-export function Providers({ children }) {
+export function Providers({
+  config,
+  flags,
+  children,
+}: {
+  config: Config;
+  flags: FlagValues;
+  children: ReactNode;
+}) {
   return (
-    <MessagesProvider>
-      <QueryClientProvider client={client}>
-        <ReactBasicsProvider>
-          <ErrorBoundary>{children}</ErrorBoundary>
-        </ReactBasicsProvider>
-      </QueryClientProvider>
-    </MessagesProvider>
+    <ConfigContext.Provider value={config}>
+      <FlagsContext.Provider value={flags}>
+        <ZenProvider>
+          <RouterProvider>
+            <MessagesProvider>
+              <QueryClientProvider client={client}>
+                <ErrorBoundary>{children}</ErrorBoundary>
+              </QueryClientProvider>
+            </MessagesProvider>
+          </RouterProvider>
+        </ZenProvider>
+      </FlagsContext.Provider>
+    </ConfigContext.Provider>
   );
 }
-
-export default Providers;

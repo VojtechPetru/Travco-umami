@@ -1,45 +1,28 @@
-import { z } from 'zod';
 import { isbot } from 'isbot';
-import { startOfHour, startOfMonth } from 'date-fns';
 import clickhouse from '@/lib/clickhouse';
-import { parseRequest } from '@/lib/request';
-import { badRequest, json, forbidden, serverError } from '@/lib/response';
-import { fetchSession, fetchWebsite } from '@/lib/load';
+import { type CollectionCache, resolveIdentifiedSession } from '@/lib/collection-session';
+import { CACHE_TOKEN_TYPE, COLLECTION_TYPE, EVENT_TYPE, FIELD_LENGTH } from '@/lib/constants';
+import { hash, secret } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { truncateString } from '@/lib/format';
 import { createToken, parseToken } from '@/lib/jwt';
-import { secret, uuid, hash } from '@/lib/crypto';
-import { COLLECTION_TYPE } from '@/lib/constants';
-import { anyObjectParam, urlOrPathParam } from '@/lib/schema';
+import { fetchWebsite } from '@/lib/load';
+import { parseRequest } from '@/lib/request';
+import { badRequest, forbidden, json, serverError } from '@/lib/response';
 import { safeDecodeURI, safeDecodeURIComponent } from '@/lib/url';
-import { createSession, saveEvent, saveSessionData } from '@/queries';
-
-const schema = z.object({
-  type: z.enum(['event', 'identify']),
-  payload: z.object({
-    website: z.string().uuid(),
-    data: anyObjectParam.optional(),
-    hostname: z.string().max(100).optional(),
-    language: z.string().max(35).optional(),
-    referrer: urlOrPathParam.optional(),
-    screen: z.string().max(11).optional(),
-    title: z.string().optional(),
-    url: urlOrPathParam.optional(),
-    name: z.string().max(50).optional(),
-    tag: z.string().max(50).optional(),
-    ip: z.string().ip().optional(),
-    userAgent: z.string().optional(),
-    timestamp: z.coerce.number().int().optional(),
-  }),
-});
+import {
+  createSession,
+  saveEvent,
+  saveSessionData,
+  saveSessionLink,
+  tryClaimAnonymousSession,
+  updateSession,
+} from '@/queries/sql';
+import { collectionSchema } from './request-schema';
 
 export async function POST(request: Request) {
   try {
-    // Bot check
-    if (!process.env.DISABLE_BOT_CHECK && isbot(request.headers.get('user-agent'))) {
-      return json({ beep: 'boop' });
-    }
-
-    const { body, error } = await parseRequest(request, schema, { skipAuth: true });
+    const { body, error } = await parseRequest(request, collectionSchema, { skipAuth: true });
 
     if (error) {
       return error();
@@ -47,8 +30,15 @@ export async function POST(request: Request) {
 
     const { type, payload } = body;
 
+    if (type === 'error') {
+      const { collectError } = await import('@/lib/errors/collect');
+      return collectError(request, payload);
+    }
+
     const {
       website: websiteId,
+      pixel: pixelId,
+      link: linkId,
       hostname,
       screen,
       language,
@@ -59,153 +49,278 @@ export async function POST(request: Request) {
       title,
       tag,
       timestamp,
+      id,
+      salt,
+      lcp,
+      inp,
+      cls,
+      fcp,
+      ttfb,
     } = payload;
 
+    const sourceId = websiteId || pixelId || linkId;
+
     // Cache check
-    let cache: { websiteId: string; sessionId: string; visitId: string; iat: number } | null = null;
-    const cacheHeader = request.headers.get('x-umami-cache');
+    let cache: CollectionCache | null = null;
 
-    if (cacheHeader) {
-      const result = await parseToken(cacheHeader, secret());
+    if (websiteId) {
+      const cacheHeader = request.headers.get('x-umami-cache');
 
-      if (result) {
-        cache = result;
+      if (cacheHeader) {
+        const result = await parseToken(cacheHeader, secret());
+
+        if (result?.type === CACHE_TOKEN_TYPE && result.websiteId === websiteId) {
+          cache = result;
+        }
+      }
+
+      // Find website. Account collection blocks are enforced by the cloud gateway.
+      if (!cache?.websiteId) {
+        const website = await fetchWebsite(websiteId);
+
+        if (!website) {
+          return badRequest({ message: 'Website not found.' });
+        }
       }
     }
 
-    // Find website
-    if (!cache?.websiteId) {
-      const website = await fetchWebsite(websiteId);
-
-      if (!website) {
-        return badRequest('Website not found.');
-      }
-    }
+    // Carried forward in the cache token so repeat identify calls skip identity writes
+    let sessionLinkId = cache?.sessionLinkId;
 
     // Client info
-    const { ip, userAgent, device, browser, os, country, subdivision1, subdivision2, city } =
-      await getClientInfo(request, payload);
+    const { ip, userAgent, device, browser, os, country, region, city } = await getClientInfo(
+      request,
+      payload,
+    );
+
+    // Bot check
+    if (!process.env.DISABLE_BOT_CHECK && isbot(userAgent)) {
+      return json({ beep: 'boop' });
+    }
 
     // IP block
     if (hasBlockedIp(ip)) {
       return forbidden();
     }
 
-    const createdAt = timestamp ? new Date(timestamp * 1000) : new Date();
-    const now = Math.floor(new Date().getTime() / 1000);
+    const createdAt = timestamp !== undefined ? new Date(timestamp * 1000) : new Date();
+    const distinctId = truncateString(id, FIELD_LENGTH.distinctId);
 
-    const sessionSalt = hash(startOfMonth(createdAt).toUTCString());
-    const visitSalt = hash(startOfHour(createdAt).toUTCString());
+    const { sessionId, visitId, iat, sessionDrift } = await resolveIdentifiedSession({
+      websiteId,
+      sourceId,
+      ip,
+      userAgent,
+      distinctId,
+      salt,
+      createdAt,
+      cache,
+      historical: timestamp !== undefined,
+      claimSession: tryClaimAnonymousSession,
+    });
 
-    const sessionId = uuid(websiteId, ip, userAgent, sessionSalt);
+    const shouldEnsureSession = !clickhouse.enabled && sessionDrift;
 
-    // Find session
-    if (!clickhouse.enabled && !cache?.sessionId) {
-      const session = await fetchSession(websiteId, sessionId);
-
-      // Create a session if not found
-      if (!session) {
-        try {
-          await createSession({
-            id: sessionId,
-            websiteId,
-            hostname,
-            browser,
-            os,
-            device,
-            screen,
-            language,
-            country,
-            subdivision1,
-            subdivision2,
-            city,
-          });
-        } catch (e: any) {
-          if (!e.message.toLowerCase().includes('unique constraint')) {
-            return serverError(e);
-          }
-        }
-      }
-    }
-
-    // Visit info
-    let visitId = cache?.visitId || uuid(sessionId, visitSalt);
-    let iat = cache?.iat || now;
-
-    // Expire visit after 30 minutes
-    if (!timestamp && now - iat > 1800) {
-      visitId = uuid(sessionId, visitSalt);
-      iat = now;
-    }
-
-    if (type === COLLECTION_TYPE.event) {
-      const base = hostname ? `https://${hostname}` : 'https://localhost';
-      const currentUrl = new URL(url, base);
-
-      let urlPath = currentUrl.pathname;
-      const urlQuery = currentUrl.search.substring(1);
-      const urlDomain = currentUrl.hostname.replace(/^www./, '');
-
-      if (process.env.REMOVE_TRAILING_SLASH) {
-        urlPath = urlPath.replace(/(.+)\/$/, '$1');
-      }
-
-      let referrerPath: string;
-      let referrerQuery: string;
-      let referrerDomain: string;
-
-      if (referrer) {
-        const referrerUrl = new URL(referrer, base);
-
-        referrerPath = referrerUrl.pathname;
-        referrerQuery = referrerUrl.search.substring(1);
-
-        if (referrerUrl.hostname !== 'localhost') {
-          referrerDomain = referrerUrl.hostname.replace(/^www\./, '');
-        }
-      }
-
-      await saveEvent({
-        websiteId,
-        sessionId,
-        visitId,
-        urlPath: safeDecodeURI(urlPath),
-        urlQuery,
-        referrerPath: safeDecodeURI(referrerPath),
-        referrerQuery,
-        referrerDomain,
-        pageTitle: safeDecodeURIComponent(title),
-        eventName: name,
-        eventData: data,
-        hostname: hostname || urlDomain,
+    // Create a session if not found
+    if ((!clickhouse.enabled && !cache?.sessionId) || shouldEnsureSession) {
+      await createSession({
+        id: sessionId,
+        websiteId: sourceId,
         browser,
         os,
         device,
         screen,
         language,
         country,
-        subdivision1,
-        subdivision2,
+        region,
         city,
-        tag,
+        distinctId,
         createdAt,
       });
     }
 
-    if (type === COLLECTION_TYPE.identify) {
-      if (!data) {
-        return badRequest('Data required.');
+    if (type === COLLECTION_TYPE.event) {
+      const base = hostname ? `https://${hostname}` : 'https://localhost';
+      const currentUrl = new URL(url, base);
+
+      let urlPath =
+        currentUrl.pathname === '/undefined' ? '' : currentUrl.pathname + currentUrl.hash;
+      const urlQuery = currentUrl.search.substring(1);
+      const urlDomain = currentUrl.hostname.replace(/^www\./, '');
+
+      let referrerPath: string;
+      let referrerQuery: string;
+      let referrerDomain: string;
+
+      // UTM Params
+      const utmSource = currentUrl.searchParams.get('utm_source');
+      const utmMedium = currentUrl.searchParams.get('utm_medium');
+      const utmCampaign = currentUrl.searchParams.get('utm_campaign');
+      const utmContent = currentUrl.searchParams.get('utm_content');
+      const utmTerm = currentUrl.searchParams.get('utm_term');
+
+      // Click IDs
+      const gclid = currentUrl.searchParams.get('gclid');
+      const fbclid = currentUrl.searchParams.get('fbclid');
+      const msclkid = currentUrl.searchParams.get('msclkid');
+      const ttclid = currentUrl.searchParams.get('ttclid');
+      const lifatid = currentUrl.searchParams.get('li_fat_id');
+      const twclid = currentUrl.searchParams.get('twclid');
+
+      if (process.env.REMOVE_TRAILING_SLASH) {
+        // Never strip the root slash, otherwise the home page is saved with an empty path
+        urlPath = urlPath.replace(/(?!^)\/(?=(#.*)?$)/, '');
       }
 
-      await saveSessionData({
-        websiteId,
+      if (referrer) {
+        // Canonicalize the event domain (lowercase, punycode, no port) so it
+        // compares correctly against the parsed referrer hostname
+        let eventDomain = urlDomain;
+        if (hostname) {
+          try {
+            eventDomain = new URL(`https://${hostname}`).hostname.replace(/^www\./, '');
+          } catch {
+            eventDomain = hostname.replace(/^www\./, '');
+          }
+        }
+        // Resolve path-only referrers against the event's domain, not the localhost fallback
+        const referrerUrl = new URL(referrer, eventDomain ? `https://${eventDomain}` : base);
+
+        referrerPath = referrerUrl.pathname;
+        referrerQuery = referrerUrl.search.substring(1);
+        referrerDomain = referrerUrl.hostname.replace(/^www\./, '');
+
+        // Never save the referrer domain for self-referrals
+        if (referrerDomain === eventDomain) {
+          referrerDomain = undefined;
+        }
+      }
+
+      const eventType = linkId
+        ? EVENT_TYPE.linkEvent
+        : pixelId
+          ? EVENT_TYPE.pixelEvent
+          : name
+            ? EVENT_TYPE.customEvent
+            : EVENT_TYPE.pageView;
+
+      await saveEvent({
+        websiteId: sourceId,
         sessionId,
-        sessionData: data,
+        visitId,
+        eventType,
+        createdAt,
+
+        // Page
+        pageTitle: safeDecodeURIComponent(title),
+        hostname: hostname || urlDomain,
+        urlPath: safeDecodeURI(urlPath),
+        urlQuery,
+        referrerPath: safeDecodeURI(referrerPath),
+        referrerQuery,
+        referrerDomain,
+
+        // Session
+        distinctId,
+        browser,
+        os,
+        device,
+        screen,
+        language,
+        country,
+        region,
+        city,
+
+        // Events
+        eventName: name,
+        eventData: data,
+        tag,
+
+        // UTM
+        utmSource,
+        utmMedium,
+        utmCampaign,
+        utmContent,
+        utmTerm,
+
+        // Click IDs
+        gclid,
+        fbclid,
+        msclkid,
+        ttclid,
+        lifatid,
+        twclid,
+      });
+    } else if (type === COLLECTION_TYPE.identify) {
+      if (websiteId && distinctId) {
+        const newLinkId = hash(sessionId, distinctId);
+
+        if (sessionLinkId !== newLinkId) {
+          // Best-effort: identity link failures must not block the session data write below.
+          try {
+            await Promise.all([
+              saveSessionLink({
+                websiteId,
+                sessionId,
+                distinctId,
+                createdAt,
+              }),
+              updateSession({
+                websiteId,
+                sessionId,
+                distinctId,
+              }),
+            ]);
+            sessionLinkId = newLinkId;
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.error('Failed to save session link:', e);
+          }
+        }
+      }
+
+      if (data) {
+        await saveSessionData({
+          websiteId,
+          sessionId,
+          sessionData: data,
+          distinctId,
+          createdAt,
+        });
+      }
+    } else if (type === COLLECTION_TYPE.performance) {
+      const base = hostname ? `https://${hostname}` : 'https://localhost';
+      const currentUrl = new URL(url, base);
+      const urlPath = currentUrl.pathname === '/undefined' ? '' : currentUrl.pathname;
+
+      await saveEvent({
+        websiteId: sourceId,
+        sessionId,
+        visitId,
+        urlPath,
+        pageTitle: safeDecodeURIComponent(title),
+        eventType: EVENT_TYPE.performance,
+        browser,
+        os,
+        device,
+        screen,
+        language,
+        country,
+        region,
+        city,
+        lcp,
+        inp,
+        cls,
+        fcp,
+        ttfb,
         createdAt,
       });
     }
 
-    const token = createToken({ websiteId, sessionId, visitId, iat }, secret());
+    const token = createToken(
+      { websiteId, sessionId, visitId, iat, sessionLinkId, type: CACHE_TOKEN_TYPE },
+      secret(),
+    );
 
     return json({ cache: token, sessionId, visitId });
   } catch (e) {

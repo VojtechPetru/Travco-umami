@@ -1,16 +1,19 @@
 import { z } from 'zod';
-import { parseRequest } from '@/lib/request';
-import { unauthorized, json } from '@/lib/response';
-import { canViewWebsite } from '@/lib/auth';
-import { getEventDataFields } from '@/queries';
+import { getQueryFilters, parseRequest } from '@/lib/request';
+import { json, unauthorized } from '@/lib/response';
+import { filterParams, withPeriodDateRange } from '@/lib/schema';
+import { canViewWebsiteSection } from '@/permissions';
+import { getEventDataFields } from '@/queries/sql';
 
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ websiteId: string }> },
 ) {
-  const schema = z.object({
+  const schema = withPeriodDateRange({
     startAt: z.coerce.number().int(),
     endAt: z.coerce.number().int(),
+    eventName: z.string().optional(),
+    ...filterParams,
   });
 
   const { auth, query, error } = await parseRequest(request, schema);
@@ -20,19 +23,15 @@ export async function GET(
   }
 
   const { websiteId } = await params;
-  const { startAt, endAt } = query;
 
-  if (!(await canViewWebsite(auth, websiteId))) {
+  if (!(await canViewWebsiteSection(auth, websiteId, 'events'))) {
     return unauthorized();
   }
 
-  const startDate = new Date(+startAt);
-  const endDate = new Date(+endAt);
+  const { eventName } = query;
+  const filters = await getQueryFilters(query, websiteId);
 
-  const data = await getEventDataFields(websiteId, {
-    startDate,
-    endDate,
-  });
+  const data = await getEventDataFields(websiteId, eventName, filters);
 
   return json(data);
 }
